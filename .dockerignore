@@ -1,0 +1,7 @@
+.git
+.DS_Store
+input
+output
+models
+__pycache__
+**/__pycache__

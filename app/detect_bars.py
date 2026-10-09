@@ -1,805 +1,206 @@
 #!/usr/bin/env python3
+"""Detect musical cut points, retain diagnostics, and export Resolve marker EDLs."""
 
 import argparse
-import json
-import os
+from collections import Counter
+import importlib.metadata
+import math
+from pathlib import Path
 import sys
 
-import librosa
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
 
-from madmom.features.downbeats import (
-    RNNDownBeatProcessor,
-    DBNDownBeatTrackingProcessor,
-)
+from .audio import analyze_attacks, load_audio
+from .export import create_click_track, create_debug_plot, create_edl, create_pcm_copy, write_json
+from .markers import assess_beats, build_bars, place_markers
+from .timecode import FrameRate, add_frames_to_timecode, parse_timecode, seconds_to_timecode
+from .tracking import Tracking, librosa_verification, local_periods, run_tracking
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-DEFAULT_FPS = 25.0
+DEFAULT_FPS = "25"
 DEFAULT_TIMELINE_START = "01:00:00:00"
 
-ONSET_MATCH_TOLERANCE = 0.12
 
-
-# ============================================================
-# TIMECODE
-# ============================================================
-
-def parse_timecode(timecode, fps):
-    """
-    Convert HH:MM:SS:FF to seconds.
-    Non-drop-frame, integer FPS.
-    """
-
-    parts = timecode.strip().split(":")
-
-    if len(parts) != 4:
-        raise ValueError(
-            f"Invalid timecode '{timecode}'. "
-            "Expected HH:MM:SS:FF"
-        )
-
-    hours, minutes, seconds, frames = map(int, parts)
-
-    fps_int = int(round(fps))
-
-    if frames < 0 or frames >= fps_int:
-        raise ValueError(
-            f"Invalid frame {frames} for {fps_int} fps. "
-            f"Valid range: 0-{fps_int - 1}"
-        )
-
-    total_seconds = (
-        hours * 3600
-        + minutes * 60
-        + seconds
-        + frames / fps
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Detect beats/downbeats and export audited DaVinci Resolve marker EDLs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    return total_seconds
-
-
-def seconds_to_timecode(seconds, fps):
-    """
-    Convert seconds to HH:MM:SS:FF.
-    Non-drop-frame, integer FPS.
-    """
-
-    if seconds < 0:
-        seconds = 0.0
-
-    fps_int = int(round(fps))
-
-    total_frames = int(round(seconds * fps))
-
-    frames = total_frames % fps_int
-    total_seconds = total_frames // fps_int
-
-    sec = total_seconds % 60
-    total_minutes = total_seconds // 60
-
-    minutes = total_minutes % 60
-    hours = total_minutes // 60
-
-    return (
-        f"{hours:02d}:"
-        f"{minutes:02d}:"
-        f"{sec:02d}:"
-        f"{frames:02d}"
-    )
-
-
-def add_frames_to_timecode(timecode, frames_to_add, fps):
-    """
-    Add frames to a non-drop-frame timecode.
-    """
-
-    hours, minutes, seconds, frames = map(
-        int,
-        timecode.split(":")
-    )
-
-    fps_int = int(round(fps))
-
-    total_frames = (
-        ((hours * 60 + minutes) * 60 + seconds) * fps_int
-        + frames
-    )
-
-    total_frames += frames_to_add
-
-    new_frames = total_frames % fps_int
-
-    total_seconds = total_frames // fps_int
-
-    new_seconds = total_seconds % 60
-
-    total_minutes = total_seconds // 60
-
-    new_minutes = total_minutes % 60
-
-    new_hours = total_minutes // 60
-
-    return (
-        f"{new_hours:02d}:"
-        f"{new_minutes:02d}:"
-        f"{new_seconds:02d}:"
-        f"{new_frames:02d}"
-    )
-
-
-# ============================================================
-# AUDIO
-# ============================================================
-
-def load_audio(audio_path):
-    """
-    Load audio as mono waveform.
-    """
-
-    print("[INFO] Loading audio...")
-
-    audio, sample_rate = librosa.load(
-        audio_path,
-        sr=None,
-        mono=True,
-    )
-
-    duration = len(audio) / sample_rate
-
-    print(
-        f"[INFO] Audio loaded: "
-        f"{duration:.2f}s @ {sample_rate} Hz"
-    )
-
-    return audio, sample_rate, duration
-
-
-# ============================================================
-# ONSET DETECTION
-# ============================================================
-
-def detect_onsets(audio, sample_rate):
-    """
-    Detect onset positions using librosa.
-
-    This is used as an auxiliary confidence signal.
-    It does NOT determine bar positions.
-    """
-
-    print("[INFO] Calculating onset envelope...")
-
-    onset_envelope = librosa.onset.onset_strength(
-        y=audio,
-        sr=sample_rate,
-    )
-
-    print("[INFO] Detecting onsets...")
-
-    onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset_envelope,
-        sr=sample_rate,
-        units="frames",
-    )
-
-    onset_times = librosa.frames_to_time(
-        onset_frames,
-        sr=sample_rate,
-    )
-
-    print(
-        f"[INFO] Detected {len(onset_times)} onset events"
-    )
-
-    return np.asarray(onset_times)
-
-
-# ============================================================
-# MADMOM
-# ============================================================
-
-def detect_madmom(audio_path):
-    """
-    Detect beats and downbeats using madmom-modern.
-
-    Returns:
-        ndarray with rows:
-        [time_seconds, beat_position]
-    """
-
-    print("[INFO] Running madmom downbeat detection...")
-
-    rnn_processor = RNNDownBeatProcessor()
-
-    activations = rnn_processor(audio_path)
-
-    dbn_processor = DBNDownBeatTrackingProcessor(
-        beats_per_bar=[4],
-        min_bpm=60,
-        max_bpm=200,
-        fps=100,
-        correct=True,
-    )
-
-    result = dbn_processor(activations)
-
-    result = np.asarray(result)
-
-    if result.size == 0:
-        raise RuntimeError(
-            "madmom did not detect any beats/downbeats."
-        )
-
-    print(
-        f"[INFO] madmom detected {len(result)} beat events"
-    )
-
-    return result
-
-
-# ============================================================
-# BPM
-# ============================================================
-
-def estimate_bpm_from_madmom(madmom_result):
-    """
-    Estimate BPM from madmom beat intervals.
-
-    Avoids librosa.feature.tempo(), which can invoke
-    problematic native code on some Apple Silicon/Docker
-    combinations.
-    """
-
-    beat_times = madmom_result[:, 0]
-
-    if len(beat_times) < 2:
-        return None
-
-    intervals = np.diff(beat_times)
-
-    intervals = intervals[
-        (intervals > 0.2)
-        & (intervals < 2.0)
-    ]
-
-    if len(intervals) == 0:
-        return None
-
-    median_interval = np.median(intervals)
-
-    bpm = 60.0 / median_interval
-
-    return float(bpm)
-
-
-# ============================================================
-# DOWNBEATS
-# ============================================================
-
-def extract_downbeats(madmom_result):
-    """
-    Extract beat-position 1 events.
-    """
-
-    downbeats = madmom_result[
-        madmom_result[:, 1] == 1
-    ]
-
-    if len(downbeats) == 0:
-        raise RuntimeError(
-            "madmom did not detect any downbeats."
-        )
-
-    downbeat_times = downbeats[:, 0]
-
-    print(
-        f"[INFO] Detected {len(downbeat_times)} downbeats"
-    )
-
-    return np.asarray(downbeat_times)
-
-
-# ============================================================
-# CONFIDENCE
-# ============================================================
-
-def calculate_confidence(
-    downbeat_time,
-    onset_times,
-):
-    """
-    Auxiliary confidence score.
-
-    1.0 = downbeat agrees with a detected onset
-    0.5 = no nearby onset
-
-    IMPORTANT:
-    This function never moves the detected downbeat.
-    """
-
-    if len(onset_times) == 0:
-        return 0.5
-
-    distance = np.min(
-        np.abs(onset_times - downbeat_time)
-    )
-
-    if distance <= ONSET_MATCH_TOLERANCE:
-        return 1.0
-
-    return 0.5
-
-
-# ============================================================
-# BAR BUILDING
-# ============================================================
-
-def build_bars(
-    downbeat_times,
-    audio_duration,
-    onset_times,
-    timeline_start_seconds,
-    fps,
-):
-    """
-    Build musical bars from consecutive downbeats.
-
-    Each bar starts at a downbeat and ends at the next
-    downbeat. The final bar ends at the audio duration.
-    """
-
-    bars = []
-
-    for index, start in enumerate(downbeat_times):
-
-        if index + 1 < len(downbeat_times):
-            end = downbeat_times[index + 1]
-        else:
-            end = audio_duration
-
-        if end <= start:
-            continue
-
-        duration = end - start
-
-        timeline_seconds = (
-            timeline_start_seconds + start
-        )
-
-        timeline_timecode = seconds_to_timecode(
-            timeline_seconds,
-            fps,
-        )
-
-        confidence = calculate_confidence(
-            start,
-            onset_times,
-        )
-
-        bar = {
-            "bar": len(bars) + 1,
-            "source_start_seconds": float(start),
-            "source_end_seconds": float(end),
-            "duration_seconds": float(duration),
-            "timeline_start_seconds": float(
-                timeline_seconds
-            ),
-            "timeline_timecode": timeline_timecode,
-            "confidence": confidence,
-        }
-
-        bars.append(bar)
-
-    print(
-        f"[INFO] Built {len(bars)} musical bars"
-    )
-
-    return bars
-
-
-# ============================================================
-# JSON
-# ============================================================
-
-def create_json(
-    bars,
-    output_path,
-    audio_path,
-    duration,
-    bpm,
-    fps,
-    timeline_start,
-):
-    """
-    Write detection results to JSON.
-    """
-
-    data = {
-        "audio": {
-            "path": audio_path,
-            "duration_seconds": duration,
-        },
-        "timeline": {
-            "start_timecode": timeline_start,
-            "fps": fps,
-            "format": "non-drop-frame",
-        },
-        "analysis": {
-            "estimated_bpm": bpm,
-            "bars_detected": len(bars),
-        },
-        "bars": bars,
+    parser.add_argument("input", help="Input audio file; analysis uses the complete source")
+    parser.add_argument("--output", help="Detailed JSON report")
+    parser.add_argument("--edl", help="Resolve timeline marker EDL")
+    parser.add_argument("--debug", help="Waveform, attacks, and marker quality PNG")
+    parser.add_argument("--click", help="Audio mixed with exported markers as audible clicks (WAV)")
+    parser.add_argument("--pcm", help="Decoded WAV copy for Resolve, with the same sample origin as analysis")
+    parser.add_argument("--fps", default=DEFAULT_FPS, help="Integer, NTSC decimal, or exact fraction (24000/1001)")
+    parser.add_argument("--drop-frame", action="store_true", help="Drop-frame labels at 29.97/59.94 FPS")
+    parser.add_argument("--timeline-start", default=DEFAULT_TIMELINE_START, help="Timeline origin timecode")
+    parser.add_argument("--audio-start", help="Absolute timecode where the trimmed audio clip starts")
+    parser.add_argument("--source-in", type=float, default=0, help="Source trim-in, seconds")
+    parser.add_argument("--source-out", type=float, help="Source trim-out, seconds (exclusive)")
+    parser.add_argument("--offset-ms", type=float, default=0, help="Manual export offset; positive delays markers")
+    parser.add_argument("--backend", choices=("madmom", "beat-this", "ensemble"), default="madmom",
+                        help="Ensemble uses Beat This! positions and checks against madmom")
+    parser.add_argument("--checkpoint", default="final0", help="Beat This! checkpoint name or local .ckpt path")
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu", help="Beat This! compute device")
+    parser.add_argument("--beat-this-dbn", action="store_true", help="Decode Beat This! with the configured DBN")
+    parser.add_argument("--beats-per-bar", default="auto", help="DBN meter candidates, e.g. 4 or 3,4; auto tests 3 and 4")
+    parser.add_argument("--min-bpm", type=float, default=40, help="DBN lower tempo bound")
+    parser.add_argument("--max-bpm", type=float, default=240, help="DBN upper tempo bound")
+    parser.add_argument("--bpm", type=float, help="DBN tempo hint; narrows bounds to +/-15%%")
+    parser.add_argument("--transition-lambda", type=float, default=100, help="DBN tempo stability; larger prefers steady tempo")
+    parser.add_argument("--activation-threshold", type=float, default=0.05, help="DBN activation boundary threshold")
+    parser.add_argument("--marker-type", choices=("beats", "downbeats"), default="downbeats", help="Every pulse or measure starts")
+    parser.add_argument("--mode", choices=("grid", "attacks"), default="grid", help="Grid includes implicit pulses; attacks requires audible evidence")
+    parser.add_argument("--strict", action="store_true", help="Export only markers that need no review")
+    parser.add_argument("--min-confidence", type=float, default=0.65, help="Quality review threshold (heuristic, not probability)")
+    parser.add_argument("--max-snap-ms", type=float, default=50, help="Maximum refinement; also capped at 10%% of the local beat period")
+    parser.add_argument("--no-refine", action="store_true", help="Retain model times for a baseline comparison")
+    parser.add_argument("--no-percussive", action="store_true", help="Skip HPSS; still analyze full mix and bass attacks")
+    parser.add_argument("--no-librosa-check", action="store_true", help="Skip the auxiliary tempo-guided phase check")
+    parser.add_argument("--silence-db", type=float, default=-60, help="Absolute low-energy floor, dBFS")
+    parser.add_argument("--debug-start", type=float, default=0, help="Debug plot start in source seconds")
+    parser.add_argument("--debug-duration", type=float, help="Debug plot length in seconds; default is remaining audio")
+    args = parser.parse_args(argv)
+    args.meter_mode = args.beats_per_bar
+    try:
+        args.beats_per_bar = [3, 4] if args.meter_mode == "auto" else sorted(set(map(int, args.meter_mode.split(","))))
+    except ValueError:
+        parser.error("--beats-per-bar must be auto or comma-separated integers")
+    if not args.beats_per_bar or any(meter < 2 or meter > 12 for meter in args.beats_per_bar):
+        parser.error("--beats-per-bar candidates must be between 2 and 12")
+    numeric = ("source_in", "source_out", "offset_ms", "min_bpm", "max_bpm", "bpm", "transition_lambda",
+               "activation_threshold", "min_confidence", "max_snap_ms", "silence_db", "debug_start", "debug_duration")
+    if any(getattr(args, name) is not None and not math.isfinite(getattr(args, name)) for name in numeric):
+        parser.error("Numeric options must be finite")
+    if args.bpm is not None:
+        if args.bpm <= 0:
+            parser.error("--bpm must be positive")
+        args.min_bpm, args.max_bpm = max(args.min_bpm, args.bpm * 0.85), min(args.max_bpm, args.bpm * 1.15)
+    if not 10 <= args.min_bpm < args.max_bpm <= 600:
+        parser.error("Require 10 <= --min-bpm < --max-bpm <= 600")
+    if args.transition_lambda <= 0 or not 0 <= args.activation_threshold < 1:
+        parser.error("Require positive --transition-lambda and 0 <= --activation-threshold < 1")
+    if not 0 <= args.min_confidence <= 1 or not 0 <= args.max_snap_ms <= 150:
+        parser.error("Require 0 <= --min-confidence <= 1 and 0 <= --max-snap-ms <= 150")
+    if args.silence_db > 0 or args.debug_start < 0 or (args.debug_duration is not None and args.debug_duration <= 0):
+        parser.error("Require --silence-db <= 0, --debug-start >= 0 and positive --debug-duration")
+    if (args.meter_mode != "auto" or args.bpm is not None or args.min_bpm != 40 or args.max_bpm != 240
+            or args.transition_lambda != 100 or args.activation_threshold != 0.05):
+        args.beat_this_dbn = True
+    return args
+
+
+def package_versions():
+    versions = {}
+    for name in ("numpy", "scipy", "librosa", "soundfile", "madmom-modern", "beat-this", "torch", "torchaudio"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return versions
+
+
+def make_report(args, audio, evidence, primary, secondary, events, bars, markers, warnings):
+    rate = FrameRate.parse(args.fps, args.drop_frame)
+    intervals = np.diff(primary.times)
+    bpm = float(60 / np.median(intervals)) if len(intervals) else None
+    periods = local_periods(primary.times)
+    meter_counts = Counter(int(x) for x in np.diff(np.flatnonzero(primary.positions == 1)))
+    return {
+        "schema_version": 2, "algorithm_version": "2.0",
+        "audio": {"path": str(Path(args.input)), "duration_seconds": audio.duration,
+                  "original_sample_rate": audio.original_sample_rate, "analysis_pcm_sample_rate": audio.sample_rate,
+                  "decoder": audio.decoder, "pcm_export_path": args.pcm},
+        "timeline": {"start_timecode": rate.format_timecode(rate.parse_timecode(args.timeline_start)),
+                     "audio_start_timecode": rate.format_timecode(rate.parse_timecode(args.audio_start or args.timeline_start)),
+                     "fps": float(rate.rate), "fps_fraction": str(rate.rate), "nominal_fps": rate.nominal,
+                     "format": "drop-frame" if rate.drop_frame else "non-drop-frame",
+                     "source_in_seconds": args.source_in, "source_out_seconds": args.source_out or audio.duration,
+                     "manual_offset_ms": args.offset_ms},
+        "analysis": {"backend": primary.backend, "secondary_backend": secondary.backend if secondary else None,
+                     "tracker": primary.metadata, "estimated_bpm": bpm,
+                     "local_bpm_range": [float(np.min(60 / periods)), float(np.max(60 / periods))] if len(periods) else None,
+                     "observed_beats_per_bar": dict(sorted(meter_counts.items())),
+                     "beats_detected": len(events), "bars_detected": len(bars),
+                     "attacks_detected": len(evidence.attacks), "markers_exported": len(markers),
+                     "markers_requiring_review": sum(event["needs_review"] for event in markers),
+                     "refined_beats": sum(abs(event["refinement_ms"]) > 0.01 for event in events),
+                     "export_status_counts": dict(Counter(event["export_status"] for event in events)),
+                     "confidence_definition": "Heuristic evidence score; not a calibrated probability of correctness.",
+                     "warnings": warnings, "dependency_versions": package_versions()},
+        "settings": vars(args), "beats": events, "bars": bars, "markers": markers,
     }
 
-    print(
-        f"[INFO] Creating JSON: {output_path}"
-    )
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            data,
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    print(
-        f"[INFO] JSON written: {output_path}"
-    )
-
-
-# ============================================================
-# DAVINCI RESOLVE MARKER EDL
-# ============================================================
-
-def create_edl(
-    bars,
-    output_path,
-    fps,
-):
-    """
-    Create a DaVinci Resolve Timeline Marker EDL.
-
-    Format is based on the EDL exported directly by
-    DaVinci Resolve using:
-
-        Timeline > Export > Timeline Markers to EDL
-
-    Each bar becomes a one-frame marker located at the
-    beginning of the musical bar.
-    """
-
-    print(
-        f"[INFO] Creating Resolve Marker EDL: "
-        f"{output_path}"
-    )
-
-    lines = [
-        "TITLE: automatic musical bar markers",
-        "FCM: NON-DROP FRAME",
-        "",
-    ]
-
-    for index, bar in enumerate(bars, start=1):
-
-        tc = bar["timeline_timecode"]
-
-        # Resolve expects a one-frame event.
-        next_tc = add_frames_to_timecode(
-            tc,
-            1,
-            fps,
-        )
-
-        # Main EDL event
-        lines.append(
-            f"{index:03d}  001      V     C        "
-            f"{tc} {next_tc} {tc} {next_tc}  "
-        )
-
-        # Marker metadata
-        lines.append(
-            f" |C:ResolveColorBlue "
-            f"|M:BAR {index:03d} "
-            f"|D:1"
-        )
-
-        lines.append("")
-
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-        newline="\n",
-    ) as f:
-        f.write("\n".join(lines))
-
-    print(
-        f"[INFO] Resolve Marker EDL written: "
-        f"{output_path}"
-    )
-
-
-# ============================================================
-# DEBUG IMAGE
-# ============================================================
-
-def create_debug_plot(
-    audio,
-    sample_rate,
-    bars,
-    output_path,
-):
-    """
-    Create a waveform/debug image showing detected bars.
-    """
-
-    print(
-        f"[INFO] Creating debug image: {output_path}"
-    )
-
-    duration = len(audio) / sample_rate
-
-    time_axis = np.linspace(
-        0,
-        duration,
-        len(audio),
-    )
-
-    plt.figure(figsize=(16, 6))
-
-    plt.plot(
-        time_axis,
-        audio,
-        linewidth=0.5,
-    )
-
-    for bar in bars:
-
-        source_time = bar[
-            "source_start_seconds"
-        ]
-
-        plt.axvline(
-            source_time,
-            linewidth=1.0,
-        )
-
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Amplitude")
-    plt.title("Detected Musical Bars")
-
-    plt.tight_layout()
-
-    plt.savefig(
-        output_path,
-        dpi=150,
-    )
-
-    plt.close()
-
-    print(
-        f"[INFO] Debug image written: {output_path}"
-    )
-
-
-# ============================================================
-# ARGUMENTS
-# ============================================================
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Detect musical bars and create "
-            "DaVinci Resolve Timeline Marker EDL."
-        )
-    )
-
-    parser.add_argument(
-        "input",
-        help="Input audio file",
-    )
-
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Output JSON file",
-    )
-
-    parser.add_argument(
-        "--edl",
-        default=None,
-        help="DaVinci Resolve Marker EDL",
-    )
-
-    parser.add_argument(
-        "--debug",
-        default=None,
-        help="Debug waveform PNG",
-    )
-
-    parser.add_argument(
-        "--timeline-start",
-        default=DEFAULT_TIMELINE_START,
-        help=(
-            "Timeline start timecode "
-            "(default: 01:00:00:00)"
-        ),
-    )
-
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=DEFAULT_FPS,
-        help="Timeline FPS (default: 25)",
-    )
-
-    return parser.parse_args()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    args = parse_arguments()
-
+def main(argv=None):
+    args = parse_arguments(argv)
     try:
-
-        # ----------------------------------------------------
-        # Validate input
-        # ----------------------------------------------------
-
-        if not os.path.isfile(args.input):
-            raise FileNotFoundError(
-                f"Input file not found: {args.input}"
-            )
-
-        if args.fps <= 0:
-            raise ValueError(
-                "FPS must be greater than zero."
-            )
-
-        # ----------------------------------------------------
-        # Timeline start
-        # ----------------------------------------------------
-
-        timeline_start_seconds = parse_timecode(
-            args.timeline_start,
-            args.fps,
-        )
-
-        # ----------------------------------------------------
-        # Audio
-        # ----------------------------------------------------
-
-        audio, sample_rate, duration = load_audio(
-            args.input
-        )
-
-        # ----------------------------------------------------
-        # Onsets
-        # ----------------------------------------------------
-
-        onset_times = detect_onsets(
-            audio,
-            sample_rate,
-        )
-
-        # ----------------------------------------------------
-        # madmom
-        # ----------------------------------------------------
-
-        madmom_result = detect_madmom(
-            args.input
-        )
-
-        # ----------------------------------------------------
-        # BPM
-        # ----------------------------------------------------
-
-        bpm = estimate_bpm_from_madmom(
-            madmom_result
-        )
-
-        if bpm is not None:
-            print(
-                f"[INFO] Estimated BPM: {bpm:.2f}"
-            )
+        source = Path(args.input).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Input file not found: {args.input}")
+        destinations = [Path(path).resolve() for path in (args.output, args.edl, args.debug, args.click, args.pcm) if path]
+        if source in destinations or len(destinations) != len(set(destinations)):
+            raise ValueError("Outputs must be distinct paths and cannot overwrite the input audio.")
+        if args.click and Path(args.click).suffix.lower() != ".wav":
+            raise ValueError("--click output must have a .wav extension.")
+        if args.pcm and Path(args.pcm).suffix.lower() != ".wav":
+            raise ValueError("--pcm output must have a .wav extension.")
+        rate = FrameRate.parse(args.fps, args.drop_frame)
+        rate.parse_timecode(args.timeline_start)
+        rate.parse_timecode(args.audio_start or args.timeline_start)
+        print("[INFO] Decoding audio once for all trackers...")
+        audio = load_audio(str(source))
+        if not 0 <= args.source_in < (args.source_out if args.source_out is not None else audio.duration) <= audio.duration + 1e-6:
+            raise ValueError("Require 0 <= --source-in < --source-out <= audio duration.")
+        if args.debug_start >= audio.duration:
+            raise ValueError("--debug-start must lie within the audio.")
+        print(f"[INFO] Audio: {audio.duration:.3f}s; high resolution attack analysis...")
+        evidence = analyze_attacks(audio, args.silence_db, not args.no_percussive)
+        warnings = list(audio.warnings)
+        if np.max(np.abs(audio.samples)) < 1e-8:
+            primary = Tracking(np.array([]), np.array([], dtype=int), np.array([]), np.array([]), 100,
+                               args.backend, {"skipped": "silent input"})
+            secondary = None
         else:
-            print(
-                "[WARN] Could not estimate BPM"
-            )
-
-        # ----------------------------------------------------
-        # Downbeats
-        # ----------------------------------------------------
-
-        downbeat_times = extract_downbeats(
-            madmom_result
-        )
-
-        # ----------------------------------------------------
-        # Bars
-        # ----------------------------------------------------
-
-        bars = build_bars(
-            downbeat_times=downbeat_times,
-            audio_duration=duration,
-            onset_times=onset_times,
-            timeline_start_seconds=timeline_start_seconds,
-            fps=args.fps,
-        )
-
-        # ----------------------------------------------------
-        # JSON
-        # ----------------------------------------------------
-
+            print(f"[INFO] Tracking with {args.backend}...")
+            primary, secondary = run_tracking(audio, args)
+        if not len(primary.times):
+            warnings.append("No beats detected. An empty marker export is produced.")
+        elif not len(primary.downbeats) and args.marker_type == "downbeats":
+            warnings.append("No downbeats detected. Try --marker-type beats or another backend.")
+        verification = None
+        if not args.no_librosa_check and len(primary.times) >= 2:
+            print("[INFO] Checking onset phase with tempo-guided librosa...")
+            try:
+                verification = librosa_verification(evidence, primary)
+                if not len(verification):
+                    warnings.append("Librosa phase check found no supported pulses.")
+            except (RuntimeError, OSError, ValueError) as exc:
+                warnings.append(str(exc))
+        events = assess_beats(primary, evidence, audio.duration, args, secondary, verification)
+        markers = place_markers(events, rate, args, audio.duration)
+        bars = build_bars(events, audio.duration)
+        report = make_report(args, audio, evidence, primary, secondary, events, bars, markers, warnings)
         if args.output:
-
-            create_json(
-                bars=bars,
-                output_path=args.output,
-                audio_path=args.input,
-                duration=duration,
-                bpm=bpm,
-                fps=args.fps,
-                timeline_start=args.timeline_start,
-            )
-
-        # ----------------------------------------------------
-        # Resolve EDL
-        # ----------------------------------------------------
-
+            write_json(report, args.output)
         if args.edl:
-
-            create_edl(
-                bars=bars,
-                output_path=args.edl,
-                fps=args.fps,
-            )
-
-        # ----------------------------------------------------
-        # Debug
-        # ----------------------------------------------------
-
+            create_edl(markers, args.edl, rate)
         if args.debug:
-
-            create_debug_plot(
-                audio=audio,
-                sample_rate=sample_rate,
-                bars=bars,
-                output_path=args.debug,
-            )
-
-        print("")
-        print("[INFO] Detection completed successfully.")
-        print(
-            f"[INFO] Bars detected: {len(bars)}"
-        )
-
+            create_debug_plot(audio, evidence, events, args.debug, args.debug_start, args.debug_duration)
+        if args.click:
+            create_click_track(audio, markers, args.click)
+        if args.pcm:
+            create_pcm_copy(audio, args.pcm)
+        for warning in warnings:
+            print(f"[WARN] {warning}")
+        analysis = report["analysis"]
+        print(f"[INFO] {len(events)} beats, {len(bars)} bars, {len(markers)} exported markers; "
+              f"{analysis['markers_requiring_review']} need review.")
+        print(f"[INFO] {analysis['refined_beats']} bounded timing refinements; "
+              f"video frame duration {1000 / float(rate.rate):.3f} ms.")
         return 0
-
     except Exception as exc:
-
-        print(
-            f"[ERROR] {exc}",
-            file=sys.stderr,
-        )
-
+        print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
 
