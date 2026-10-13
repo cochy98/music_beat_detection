@@ -5,3 +5,10 @@ output
 models
 __pycache__
 **/__pycache__
+**/node_modules
+**/dist
+.env
+.local-data
+test-results
+playwright-report
+**/*.tsbuildinfo

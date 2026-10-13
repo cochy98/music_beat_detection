@@ -1,0 +1,10 @@
+# Use with a separate project: docker compose -p beat-studio-dev -f compose.yaml -f compose.dev.yaml up --build -d redis worker
+services:
+  redis:
+    ports:
+      - "127.0.0.1:${DEV_REDIS_PORT:-6388}:6379"
+  worker:
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    volumes:
+      - ./.local-data:/data
+      - ./.local-data/models:/models

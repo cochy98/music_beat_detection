@@ -5,3 +5,10 @@ models/
 __pycache__/
 *.pyc
 .pytest_cache/
+node_modules/
+dist/
+.env
+.local-data/
+playwright-report/
+test-results/
+*.tsbuildinfo

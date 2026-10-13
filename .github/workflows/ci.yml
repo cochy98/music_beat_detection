@@ -1,0 +1,171 @@
+name: Build and publish Beat Studio
+
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+    # GitHub applies path filters to branches, but always runs tag pushes.
+    paths:
+      - 'app/**'
+      - 'worker/**'
+      - 'api/**'
+      - 'web/**'
+      - 'shared/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'requirements*.txt'
+      - 'package*.json'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'compose*.yaml'
+      - '*.sh'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'worker/**'
+      - 'api/**'
+      - 'web/**'
+      - 'shared/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'requirements*.txt'
+      - 'package*.json'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'compose*.yaml'
+      - '*.sh'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # New branch commits supersede old builds; release builds are never cancelled.
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: docker compose config --quiet
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build worker for Python tests
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: worker
+          build-args: WITH_BEAT_THIS=1
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: beat-studio-worker-test
+          cache-from: type=gha,scope=worker-tests
+          cache-to: type=gha,mode=max,scope=worker-tests
+      - run: docker run --rm --entrypoint python -v "$PWD/tests:/app/tests:ro" beat-studio-worker-test -m unittest discover -s tests -v
+      - run: docker run --rm --entrypoint python beat-studio-worker-test -m unittest worker.test_worker -v
+
+  images:
+    name: Docker / ${{ matrix.image }}
+    needs: [typescript, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: web
+            dockerfile: web/Dockerfile
+            target: ''
+            beat_this: '0'
+          - image: api
+            dockerfile: api/Dockerfile
+            target: ''
+            beat_this: '0'
+          - image: worker
+            dockerfile: Dockerfile
+            target: worker
+            beat_this: '1'
+          - image: cli
+            dockerfile: Dockerfile
+            target: cli
+            beat_this: '0'
+          - image: cli-full
+            dockerfile: Dockerfile
+            target: cli
+            beat_this: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set image name
+        id: image
+        shell: bash
+        env:
+          IMAGE_SUFFIX: ${{ matrix.image }}
+        run: printf 'name=ghcr.io/%s-%s\n' "${GITHUB_REPOSITORY,,}" "$IMAGE_SUFFIX" >> "$GITHUB_OUTPUT"
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # Only main updates latest; pushing an older release must not roll it back.
+          flavor: latest=false
+          tags: |
+            type=sha,format=long
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build images and publish trusted refs
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          build-args: WITH_BEAT_THIS=${{ matrix.beat_this }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=${{ matrix.image }}
+            type=gha,scope=worker-tests
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

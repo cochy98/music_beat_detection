@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim AS detector
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -32,3 +32,16 @@ RUN if [ "$WITH_BEAT_THIS" = "1" ]; then \
 COPY app ./app
 
 ENTRYPOINT ["python", "-m", "app.detect_bars"]
+
+FROM detector AS worker
+COPY worker/requirements.txt /tmp/worker-requirements.txt
+RUN pip install -r /tmp/worker-requirements.txt \
+    && useradd --uid 1000 --create-home worker \
+    && mkdir -p /data /models/torch \
+    && chown -R worker:worker /data /models
+COPY worker ./worker
+USER worker
+ENTRYPOINT ["python", "-m", "worker.main"]
+
+# Preserve the original CLI build and entrypoint for build.sh/start.sh.
+FROM detector AS cli
