@@ -1,6 +1,6 @@
 numpy==2.4.6
 scipy==1.17.1
-librosa==0.11.0
+librosa==1.0.0
 soundfile==0.14.0
 matplotlib==3.11.2
 
