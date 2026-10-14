@@ -8,6 +8,7 @@ ENV OMP_NUM_THREADS=2
 ENV OPENBLAS_NUM_THREADS=2
 ENV TORCH_HOME=/models/torch
 
+ARG SECURITY_REFRESH=manual
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
@@ -36,6 +37,8 @@ ENTRYPOINT ["python", "-m", "app.detect_bars"]
 FROM detector AS worker
 COPY worker/requirements.txt /tmp/worker-requirements.txt
 RUN pip install -r /tmp/worker-requirements.txt \
+    && python -m pip check \
+    && python -m pip uninstall -y pip \
     && useradd --uid 1000 --create-home worker \
     && mkdir -p /data /models/torch \
     && chown -R worker:worker /data /models
@@ -45,3 +48,4 @@ ENTRYPOINT ["python", "-m", "worker.main"]
 
 # Preserve the original CLI build and entrypoint for build.sh/start.sh.
 FROM detector AS cli
+RUN python -m pip check && python -m pip uninstall -y pip

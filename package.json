@@ -2,12 +2,17 @@
   "name": "beat-studio",
   "private": true,
   "type": "module",
-  "workspaces": ["api", "web"],
+  "workspaces": [
+    "api",
+    "web"
+  ],
   "scripts": {
     "build": "npm run build --workspace api && npm run build --workspace web",
-    "test": "npm run test --workspace api",
+    "test": "npm run test --workspace api && npm run test --workspace web",
     "dev:api": "npm run dev --workspace api",
     "dev:web": "npm run dev --workspace web"
   },
-  "engines": { "node": ">=22.12.0" }
+  "engines": {
+    "node": ">=22.12.0"
+  }
 }

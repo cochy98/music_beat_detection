@@ -12,14 +12,16 @@ docker compose up --build -d
 
 Aprire **http://localhost:8088**. La prima build installa anche PyTorch CPU e Beat This! e può richiedere diversi minuti. Il primo job Beat This!/ensemble scarica il checkpoint; il volume `checkpoints` lo conserva per gli avvii successivi.
 
-1. Caricare un file MP3, WAV, FLAC, OGG, M4A, AAC, AIFF o OPUS, fino a 200 MB.
+1. Caricare un file MP3, WAV, FLAC, OGG, M4A, AAC, AIFF o OPUS, fino a 50 MB.
 2. Scegliere madmom, Beat This! o ensemble, gli inizi di misura o tutti i beat, il metro e un eventuale suggerimento BPM.
 3. Impostare i parametri avanzati se necessari: intervallo BPM, decoder DBN, qualità, affinamento, FPS, timecode, trim e offset.
 4. Avviare il job. Il frontend riceve gli aggiornamenti via **SSE**, con polling di riserva se la connessione cade. La percentuale indica fasi di lavoro, non una previsione della durata.
 5. Esplorare la forma d'onda con zoom e scorrimento, cliccare per spostare il cursore, selezionare i marker e ascoltare il PCM o l'audio con click. I marker verdi sono confermati; quelli gialli richiedono verifica. La timeline mostra `export_source_seconds`, le stesse posizioni quantizzate ai fotogrammi usate nell'EDL e nei click. Le aree esterne ai trim sono attenuate.
 6. Scaricare il pacchetto ZIP o i singoli EDL, JSON, WAV e PNG. Il report conserva le informazioni originali del rilevatore; il ZIP include anche il log e i picchi della forma d'onda.
 
-Le ultime 12 sessioni vengono memorizzate nel browser. Ricaricare la pagina recupera lo stato dell'ultimo job dal server, anche se l'analisi è ancora in corso. I file e i metadati persistono nei volumi Docker; non viene applicata una cancellazione automatica. Per ripetere un'analisi dopo un refresh occorre selezionare nuovamente il file locale.
+L'accesso è pubblico senza account. Una sessione anonima con cookie HttpOnly associa ogni job al suo browser: conoscere l'UUID non permette di accedere ai risultati di altri utenti. Il browser conserva soltanto il riferimento al job attivo in `sessionStorage`; un reload recupera l'analisi in coda o in corso. Dopo aver mostrato il risultato, il riferimento viene cancellato e il reload successivo riparte vuoto. Se la risposta all'upload si perde, `/api/active-job` permette di recuperare il job accettato.
+
+I report e gli audio restano **solo nel volume dei file**, mai in Redis. Redis conserva temporaneamente i metadati di lavoro e la coda con AOF, necessari al recupero dopo un riavvio. Il servizio `cleanup` cancella input, risultati, log e metadati **24 ore dopo la conclusione**, con una verifica ogni 5 minuti. La pulizia tratta anche gli upload orfani e non elimina i job con lease attivo. I metadati hanno inoltre una scadenza di sicurezza se la pulizia rimane ferma. La pulizia richiede anche una riscrittura periodica dell’AOF per rimuovere i metadati cancellati dalla sua cronologia operativa. Non esiste una cronologia permanente delle analisi.
 
 ```mermaid
 flowchart LR
@@ -36,11 +38,11 @@ flowchart LR
 
 Il detector viene eseguito come subprocess isolato per job all'interno del container worker. L'API non avvia Python e non attende il risultato nella richiesta di upload. Ogni job ha UUID, directory separata e stato `queued → running → completed/failed`. Il worker prepara i risultati in una directory temporanea e li pubblica solo a elaborazione completata. Upload e download grandi vengono trasferiti in streaming; i WAV supportano richieste HTTP Range per il seek audio.
 
-Redis conserva metadati e messaggi con AOF (`appendfsync everysec`, con possibile perdita dell'ultimo secondo in caso di crash dell'host). I job in corso rimangono pending: lease rinnovabile di 60 secondi, heartbeat ogni 10 secondi e recupero tramite `XAUTOCLAIM` dopo 90 secondi di inattività. Un'interruzione ripete l'analisi dall'inizio, fino a 3 tentativi; un errore del detector o un timeout conclude il job come fallito e viene mostrato nel frontend. Ogni worker elabora un job alla volta; `docker compose up -d --scale worker=2` permette due analisi simultanee, con maggiore uso di CPU e memoria.
+Redis conserva metadati e messaggi con AOF (`appendfsync everysec`, con possibile perdita dell'ultimo secondo in caso di crash dell'host). I job in corso rimangono pending: lease rinnovabile di 60 secondi, heartbeat ogni 10 secondi e recupero tramite `XAUTOCLAIM` dopo 90 secondi di inattività. Un'interruzione ripete l'analisi dall'inizio, fino a 3 tentativi; un errore del detector o un timeout conclude il job come fallito e viene mostrato nel frontend. Distribuire **un solo worker**: ogni istanza elabora un job alla volta. Sulla VPS da 2 CPU/4 GB non aumentare le repliche. Sono ammessi al massimo 6 job non terminati, includendo gli upload prenotati: con un worker occupato restano fino a 5 posti. I controlli globali, per sessione (1 job) e per IP (2 job) sono atomici in Redis.
 
 ### Configurazione e gestione
 
-Copiare `.env.example` in `.env` per modificare porta, indirizzo di ascolto, limite upload, timeout di analisi (default 1800 secondi) e durata massima audio (default 3600 secondi). Nginx accetta al massimo 1 GB per richiesta; il limite applicativo più restrittivo è controllato da `MAX_UPLOAD_MB`. Il limite della durata è verificato da FFprobe; l'estensione del file da sola non basta a renderlo un audio valido.
+Copiare `.env.example` in `.env` per modificare porta, indirizzo di ascolto, limite upload, timeout complessivo del job (default 600 secondi) e durata massima audio (default 300 secondi). Nginx accetta al massimo 51 MB per richiesta, includendo il multipart; il limite applicativo più restrittivo è controllato da `MAX_UPLOAD_MB`. Il limite della durata è verificato da FFprobe; l'estensione del file da sola non basta a renderlo un audio valido.
 
 ```bash
 docker compose ps
@@ -48,15 +50,20 @@ docker compose logs -f api worker
 docker compose stop                 # arresto; dati conservati
 docker compose up -d                # riavvio
 docker compose down                 # rimuove container e rete; dati conservati
+# Primo aggiornamento da una versione precedente: attendere i job, fare down
+# senza -v e poi up --build, per ricreare anche la nuova rete interna.
 ```
 
-Il servizio web è esposto su **127.0.0.1** per default. API, Redis e worker sono sulla rete interna Docker. È una configurazione locale/singolo utente: chi può raggiungere l'app può creare job e accedere a un job di cui conosce l'UUID. Per pubblicarla su Internet aggiungere autenticazione, autorizzazione dei job, TLS, quote e una politica di conservazione. Non usare `docker compose down -v` se si vogliono conservare risultati, coda e checkpoint.
+Il servizio web è esposto su **127.0.0.1** per default. API, Redis e worker sono sulla rete interna Docker. Il Compose di sviluppo usa cookie senza flag Secure per HTTP locale. Per Internet usare il Compose di produzione descritto sotto, con HTTPS, cookie Secure con prefisso `__Host-`, rete interna e limiti di risorse. Non usare `docker compose down -v` sul progetto di produzione: elimina coda, checkpoint e file delle analisi attive.
+
 
 ### Contratto REST
 
 | Metodo | Endpoint | Risposta |
 | --- | --- | --- |
 | GET | `/api/health` | Stato Redis e presenza di un worker |
+| POST | `/api/session` | Inizializza/rinnova il cookie anonimo; richiede `X-Beat-Studio: 1` |
+| GET | `/api/active-job` | Job in coda/in corso appartenente alla sessione, oppure null |
 | GET | `/api/config` | Algoritmi, default e limite upload in byte |
 | POST | `/api/jobs` | Multipart: `audio` (file) e `config` (JSON), ordine libero; `202` con job e header Location |
 | GET | `/api/jobs/:id` | Stato, fasi, impostazioni, eventuale errore |
@@ -66,12 +73,16 @@ Il servizio web è esposto su **127.0.0.1** per default. API, Redis e worker son
 | GET | `/api/jobs/:id/files/:artifact` | `zip`, `json`, `edl`, `clicks`, `pcm`, `debug`; supporto HTTP Range |
 
 ```bash
-curl -F 'audio=@input/music.mp3' \
+curl -c /tmp/beat-cookies -X POST -H 'X-Beat-Studio: 1' http://localhost:8088/api/session
+curl -b /tmp/beat-cookies -H 'X-Beat-Studio: 1' \
+  -F 'audio=@input/music.mp3' \
   -F 'config={"backend":"ensemble","markerType":"beats","fps":"25","beatsPerBar":"4"}' \
   http://localhost:8088/api/jobs
+# Anche richieste di stato, SSE e download richiedono lo stesso cookie.
 ```
 
-La definizione condivisa in `shared/config.ts` convalida sia il form sia l'API. Sono accettate solo opzioni note, CPU e checkpoint `final0`/`small0`: nessun percorso di output o comando arbitrario viene passato dal client. Valori non validi restituiscono `400`; upload troppo grandi `413`, estensioni non supportate `415`, job assenti `404`, risultati non pronti `409`. L'API limita gli upload a 10 richieste/minuto e le altre richieste a 120/minuto per indirizzo visto dall'API (nel Compose, il proxy Nginx); il flusso SSE è escluso dal limite.
+La definizione condivisa in `shared/config.ts` convalida sia il form sia l'API. Sono accettate solo opzioni note, CPU e il checkpoint `small0` (default). `final0` richiede `ALLOW_LARGE_MODEL=true` in API e worker, dopo aver dimensionato e misurato la RAM: nessun percorso di output o comando arbitrario viene passato dal client. Valori non validi restituiscono `400`; upload troppo grandi `413`, estensioni non supportate `415`, job assenti `404`, risultati non pronti `409`. L'API limita i tentativi di upload a 3/minuto per IP e le altre richieste a 120/minuto, con contatori condivisi in Redis. Le richieste POST richiedono un header applicativo e respingono origini diverse. Nginx sovrascrive gli header client inoltrati e Fastify si fida soltanto del suo indirizzo interno. SSE ha limiti separati: 2 connessioni per sessione, 10 per IP e 50 globali, con lease rinnovabile e chiusura dei client lenti. `410` indica un risultato scaduto; dopo la cancellazione dei metadati il job restituisce `404`.
+
 
 ### Sviluppo e verifiche
 
@@ -98,7 +109,7 @@ Per hot reload, avviare un Redis esposto **solo in locale** e il worker con un b
 
 ```bash
 mkdir -p .local-data/models
-LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) docker compose -p beat-studio-dev -f compose.yaml -f compose.dev.yaml up --build -d redis worker
+LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) docker compose -p beat-studio-dev -f compose.yaml -f compose.dev.yaml up --build -d redis worker cleanup
 REDIS_URL=redis://localhost:6388 DATA_DIR="$PWD/.local-data" npm run dev:api
 # In un altro terminale:
 npm run dev:web
@@ -120,10 +131,11 @@ I nomi delle immagini sono ricavati automaticamente dal repository, in minuscolo
 | `ghcr.io/<owner>/<repository>-web` | Frontend React servito da Nginx |
 | `ghcr.io/<owner>/<repository>-api` | REST API Fastify |
 | `ghcr.io/<owner>/<repository>-worker` | Worker Python con madmom e Beat This! |
+| `ghcr.io/<owner>/<repository>-redis` | Redis ufficiale con pacchetti di sistema aggiornati |
 | `ghcr.io/<owner>/<repository>-cli` | Rilevatore CLI con madmom |
 | `ghcr.io/<owner>/<repository>-cli-full` | Rilevatore CLI con madmom e Beat This! |
 
-Redis usa l'immagine ufficiale già presente nel Compose. Tutte le immagini pubblicate ricevono il tag `sha-<commit SHA completo>`. Le build di `main` aggiornano anche `main` e `latest`. Le release ricevono il tag Git (per esempio `v1.2.3`) e, per i tag SemVer, anche la versione `1.2.3`; non aggiornano `latest`. I tag Git non compatibili con i nomi Docker vengono normalizzati da `docker/metadata-action`.
+Redis usa un’immagine derivata da quella ufficiale, con i pacchetti Alpine aggiornati. Tutte le immagini pubblicate ricevono il tag `sha-<commit SHA completo>`. Le build di `main` aggiornano anche `main` e `latest`. Le release ricevono il tag Git (per esempio `v1.2.3`) e, per i tag SemVer, anche la versione `1.2.3`; non aggiornano `latest`. I tag Git non compatibili con i nomi Docker vengono normalizzati da `docker/metadata-action`.
 
 Per avviare una release dopo aver salvato le modifiche nel repository:
 
@@ -135,6 +147,84 @@ docker pull ghcr.io/owner/repository-worker:v1.2.3
 ```
 
 Il workflow usa `GITHUB_TOKEN` con `contents: read` e `packages: write` nel solo job delle immagini: non occorre configurare un PAT per la pubblicazione. GitHub Actions e la creazione dei package devono essere consentiti dalle impostazioni del repository/organizzazione. Per un package preesistente, verificare che il repository abbia accesso di scrittura. I package nuovi seguono la visibilità iniziale di GHCR; per scaricare immagini private occorre effettuare il login a `ghcr.io`. Per i dettagli vedere la [documentazione di GitHub Container Registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+
+### Deploy manuale sulla VPS
+
+Usare `compose.prod.yaml` **da solo**, senza sovrapporlo al Compose di sviluppo. La pipeline continua a fare esclusivamente build, test, scansione e pubblicazione: non contiene SSH, credenziali VPS o deploy automatici. I controlli includono browser/reload, ammissione atomica su Redis, coda reale, autorizzazione, riavvio worker e pulizia. Le build aggiornano i pacchetti di sistema, rimuovono npm/pip dalle immagini runtime e fissano le dipendenze Python corrette. Trivy blocca vulnerabilità HIGH/CRITICAL per le quali esiste una correzione nelle immagini web/API/worker e Redis; le vulnerabilità senza correzione non bloccano la pubblicazione. Oltre al controllo prima della pubblicazione, viene scansionato il digest esatto appena pubblicato: attendere comunque il successo completo del workflow. La scansione delle immagini avviene su AMD64; le build pubblicate includono anche ARM64. Dependabot propone aggiornamenti settimanali.
+
+I servizi di produzione sono `web`, `api`, un `worker`, `redis` e `cleanup`; il reverse proxy HTTPS esistente resta esterno allo stack. `models` è un comando di preparazione, non un servizio permanente. Non distribuire le immagini CLI. Il worker ha 1,5 CPU, 2560 MB di RAM, 150 processi massimi e nessuna rete esterna; i checkpoint sono montati in sola lettura. Tutti i servizi hanno filesystem root in sola lettura, capability rimosse, `no-new-privileges` e log ruotati. Redis usa `noeviction` per non perdere messaggi quando raggiunge il limite di memoria. Il servizio di pulizia ha risorse separate.
+
+1. Attendere il successo **dell'intero workflow**. Nei riepiloghi dei job Docker copiare i riferimenti `ghcr.io/...@sha256:...` per web, API, worker e Redis della stessa esecuzione in `.env.production`, partendo da `.env.production.example`. In alternativa usare `sha-<SHA completo>` della stessa esecuzione; i digest garantiscono riferimenti immutabili. Non usare `latest` per il deploy. Se GHCR è privato, autenticarsi sul server con una credenziale di sola lettura per i package.
+2. Verificare che le subnet `10.203.88.0/24` e `10.203.89.0/24` siano libere. Il backend usa la prima; creare la rete dedicata al solo proxy e al frontend:
+
+   ```bash
+   docker network create --subnet 10.203.89.0/24 beat-studio-proxy
+   ```
+
+3. Aggiungere la rete anche al Compose del reverse proxy esistente, assegnandogli **10.203.89.2** su questa rete. Sostituire `proxy` con il nome del proprio servizio; mantenere le altre reti già utilizzate:
+
+   ```yaml
+   services:
+     proxy:
+       networks:
+         beat-studio-proxy:
+           ipv4_address: 10.203.89.2
+   networks:
+     beat-studio-proxy:
+       external: true
+   ```
+
+   Per collegare una prima volta il container già esistente, usare `docker network connect --ip 10.203.89.2 beat-studio-proxy NOME_CONTAINER_PROXY`; la modifica al suo Compose è necessaria per conservare il collegamento dopo una ricreazione. Non collegare il proxy alla rete backend. Se si cambiano le subnet, aggiornare coerentemente il Compose, `TRUSTED_PROXIES` e `set_real_ip_from` in Nginx.
+
+4. Scaricare le immagini e preparare entrambi i checkpoint con il comando che ha accesso a Internet. Eseguirlo prima del primo avvio, mentre il worker non è in elaborazione:
+
+   ```bash
+   docker compose --env-file .env.production -f compose.prod.yaml config --quiet
+   docker compose --env-file .env.production -f compose.prod.yaml pull
+   docker compose --env-file .env.production -f compose.prod.yaml --profile prepare run --rm models
+   docker compose --env-file .env.production -f compose.prod.yaml up -d --wait
+   ```
+
+   Il worker di produzione rifiuta l'avvio se i checkpoint mancano. Le impostazioni iniziali sono 50 MB per file, 5 minuti di audio, massimo 2 canali/96 kHz, 10 minuti per l'intero job e 2 ore massime di attesa. L'audio viene decodificato da FFmpeg con soli protocolli locali e normalizzato a 44,1 kHz. L'API rifiuta nuovi upload se rimangono meno di 5 GB liberi o se il budget dei dati temporanei (5 GB) non può assorbire upload concorrenti e il prossimo output. Il profilo pubblico usa `small0`: nel test locale con i limiti di produzione, ensemble su audio sintetico di 5 minuti ha completato in circa 45 secondi; `final0` sullo stesso audio ha raggiunto i 2,5 GB ed è stato interrotto dal limite di memoria. Per questo `final0` è disabilitato nell’API e nel worker del profilo da 4 GB. I tempi dipendono da CPU, architettura e contenuto audio; non sono una previsione per la VPS. Non aumentare durata/repliche o abilitare il modello grande prima di misurare memoria e tempi.
+
+5. Nel virtual host HTTPS di **battute.duckdns.org**, conservare certificati/TLS esistenti e inoltrare al nome Docker `beat-studio-web:8080`. Per Nginx:
+
+   ```nginx
+   location / {
+       proxy_pass http://beat-studio-web:8080;
+       proxy_http_version 1.1;
+       proxy_set_header Host $host;
+       # Sovrascrivere, senza concatenare header inviati dal client.
+       proxy_set_header X-Forwarded-For $remote_addr;
+       proxy_set_header X-Forwarded-Proto $scheme;
+       proxy_set_header Connection "";
+       proxy_cache off;
+       proxy_buffering off;
+       proxy_request_buffering off;
+       proxy_read_timeout 3600s;
+       client_max_body_size 51m;
+   }
+   ```
+
+   Ricaricare il proxy dopo che il frontend è avviato. Non pubblicare porte di API/Redis/worker; il Compose di produzione non pubblica neppure la porta web sul sistema host. Se il proxy è Traefik/Caddy, configurare l'equivalente e la stessa sovrascrittura affidabile dell'IP client. Se il proxy è a sua volta dietro una CDN, configurare prima i suoi IP fidati senza accettare header arbitrari da Internet.
+
+6. Verificare `./scripts/check-deployment.sh`, poi avviare un'analisi nel browser, ricaricare durante l'elaborazione e controllare un download. Tenere sotto osservazione `docker stats`, spazio disco, latenza della coda e `docker compose ... logs api worker cleanup`. L'healthcheck API verifica Redis; lo script controlla anche presenza del worker e della pulizia. Docker non riavvia automaticamente un container soltanto perché è unhealthy: serve controllare gli healthcheck o usare il monitoraggio della VPS.
+
+Per gli aggiornamenti, salvare prima `.env.production` come `.env.production.previous`, annotare la revisione del Compose e sospendere brevemente gli upload sul proxy. Fermare l'API per impedire nuove accettazioni, attendere la fine del job attivo (oppure accettare che un riavvio lo ripeta), quindi aggiornare i quattro riferimenti della stessa release ed eseguire `pull` e `up -d --wait`. Verificare con lo script e riaprire gli upload. La coda e i volumi devono rimanere gli stessi.
+
+Per il rollback usare i riferimenti precedenti e il Compose della revisione precedente, eseguire `pull`/`up -d --wait` e ripetere la verifica. Non eliminare i volumi. Il primo passaggio dalla vecchia versione richiede di terminare i job precedenti: non avevano un proprietario anonimo e non vengono resi accessibili alle nuove sessioni. La pulizia rimuove anche questi vecchi risultati dopo il periodo di conservazione.
+
+Per riprodurre i test d'integrazione in locale, con Compose >= 2.24.4 (supporto a `!override`), usare un progetto separato:
+
+```bash
+docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml build api web worker redis
+docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml up --no-build --wait redis api web cleanup
+python3 scripts/test-web-integration.py
+# Solo per il progetto di test:
+docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml down -v
+npx playwright install chromium
+npm run test:e2e --workspace web
+```
 
 ## Avvio
 

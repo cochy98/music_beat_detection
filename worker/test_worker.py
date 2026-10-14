@@ -38,5 +38,25 @@ class WorkerTest(unittest.TestCase):
             self.assertAlmostEqual(min(p[0] for p in preview["peaks"]), -0.8)
 
 
+
+class SafetyTests(unittest.TestCase):
+    def test_probe_rejects_unbounded_audio(self):
+        from worker.main import validate_probe
+        valid = {"format": {"duration": "10"}, "streams": [{"codec_type": "audio", "channels": 2, "sample_rate": "44100"}]}
+        self.assertEqual(validate_probe(valid), (2, 44100))
+        for duration, channels, rate in [("nan", 2, "44100"), ("999999", 2, "44100"), ("10", 8, "44100"), ("10", 2, "384000")]:
+            bad = {"format": {"duration": duration}, "streams": [{"codec_type": "audio", "channels": channels, "sample_rate": rate}]}
+            with self.assertRaises(ValueError):
+                validate_probe(bad)
+
+    def test_deadline_terminates_a_stalled_stage(self):
+        import sys, time
+        from worker.main import run_stage
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            run_stage([sys.executable, "-c", "import time; time.sleep(30)"], started + 0.1)
+        self.assertLess(time.monotonic() - started, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

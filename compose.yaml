@@ -1,6 +1,8 @@
 name: beat-studio
 services:
   web:
+    networks:
+      default: {ipv4_address: 10.203.88.3}
     build:
       context: .
       dockerfile: web/Dockerfile
@@ -17,13 +19,21 @@ services:
       retries: 3
 
   api:
+    networks:
+      default: {ipv4_address: 10.203.88.4}
     build:
       context: .
       dockerfile: api/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379
       DATA_DIR: /data
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      ALLOW_LARGE_MODEL: ${ALLOW_LARGE_MODEL:-false}
+      TRUSTED_PROXIES: 10.203.88.3
+      MAX_ACTIVE_JOBS: ${MAX_ACTIVE_JOBS:-6}
+      MAX_JOBS_PER_IP: ${MAX_JOBS_PER_IP:-2}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-1024}
+      MAX_DATA_MB: ${MAX_DATA_MB:-5120}
     volumes:
       - jobs:/data
     depends_on:
@@ -38,6 +48,8 @@ services:
       retries: 5
 
   worker:
+    networks:
+      default: {ipv4_address: 10.203.88.6}
     build:
       context: .
       target: worker
@@ -46,8 +58,10 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       DATA_DIR: /data
-      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
-      MAX_AUDIO_SECONDS: ${MAX_AUDIO_SECONDS:-3600}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-600}
+      MAX_AUDIO_SECONDS: ${MAX_AUDIO_SECONDS:-300}
+      ALLOW_LARGE_MODEL: ${ALLOW_LARGE_MODEL:-false}
+      RETENTION_SECONDS: ${RETENTION_SECONDS:-86400}
       NUMBA_CPU_NAME: generic
       NUMBA_CACHE_DIR: /tmp/numba
       MPLCONFIGDIR: /tmp/matplotlib
@@ -61,14 +75,36 @@ services:
     init: true
     stop_grace_period: 15s
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,redis; r=redis.Redis.from_url(os.environ['REDIS_URL']); assert r.exists('beat:worker:alive')"]
+      test: ["CMD", "python", "-c", "import os,redis; r=redis.Redis.from_url(os.environ['REDIS_URL']); import socket; assert r.exists('beat:worker:alive:'+socket.gethostname())"]
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 30s
 
+  cleanup:
+    networks:
+      default: {ipv4_address: 10.203.88.7}
+    build:
+      context: .
+      target: worker
+      args: {WITH_BEAT_THIS: "1"}
+    entrypoint: [python, -m, worker.cleanup]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATA_DIR: /data
+      RETENTION_SECONDS: ${RETENTION_SECONDS:-86400}
+      MAX_QUEUE_AGE_SECONDS: ${MAX_QUEUE_AGE_SECONDS:-7200}
+    volumes: [jobs:/data]
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
   redis:
-    image: redis:7.4-alpine
+    networks:
+      default: {ipv4_address: 10.203.88.5}
+    build:
+      context: .
+      dockerfile: redis/Dockerfile
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - queue:/data
@@ -83,3 +119,8 @@ volumes:
   jobs:
   checkpoints:
   queue:
+
+networks:
+  default:
+    ipam:
+      config: [{subnet: 10.203.88.0/24}]

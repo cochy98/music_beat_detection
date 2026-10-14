@@ -1,0 +1,32 @@
+# Isolated integration stack; never use this overlay for production.
+services:
+  web:
+    image: beat-studio-web-test
+    ports: !override ["127.0.0.1:8089:8080"]
+    networks:
+      default: {ipv4_address: 10.203.91.3}
+  api:
+    networks:
+      default: {ipv4_address: 10.203.91.4}
+    image: beat-studio-api-test
+    environment:
+      TRUSTED_PROXIES: 10.203.91.3
+      MIN_FREE_DISK_MB: 16
+  worker:
+    networks:
+      default: {ipv4_address: 10.203.91.6}
+    image: beat-studio-worker-test
+    mem_limit: 2560m
+    cpus: 1.5
+  cleanup:
+    networks:
+      default: {ipv4_address: 10.203.91.7}
+    image: beat-studio-worker-test
+  redis:
+    image: beat-studio-redis-test
+    networks:
+      default: {ipv4_address: 10.203.91.5}
+networks:
+  default:
+    ipam:
+      config: !override [{subnet: 10.203.91.0/24}]

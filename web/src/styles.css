@@ -438,27 +438,6 @@ main {
   background: #acc5ae;
   border-radius: 3px;
 }
-.history-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 24px;
-  gap: 12px;
-}
-.history-row > span {
-  font-size: 9px;
-  color: var(--muted);
-  letter-spacing: 1px;
-}
-.history-row select {
-  max-width: 65%;
-  font-size: 11px;
-  border: 1px solid var(--line);
-  background: #1a231d;
-  border-radius: 4px;
-  padding: 8px;
-  color: #c1cec2;
-}
 .empty-state {
   position: relative;
   border: 1px solid var(--line);
@@ -1234,13 +1213,6 @@ footer span:last-child {
   }
   .marker-inspector dl {
     flex-wrap: wrap;
-  }
-  .history-row select {
-    max-width: 70%;
-    font-size: 10px;
-  }
-  .history-row > span {
-    font-size: 8px;
   }
   .job-progress {
     padding: 18px;

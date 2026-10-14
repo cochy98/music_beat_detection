@@ -51,7 +51,7 @@ export const configSchema = z
     maxBpm: z.number().min(11).max(600).default(240),
     transitionLambda: z.number().positive().max(1000).default(100),
     activationThreshold: z.number().min(0).max(0.99).default(0.05),
-    checkpoint: z.enum(["final0", "small0"]).default("final0"),
+    checkpoint: z.enum(["final0", "small0"]).default("small0"),
     beatThisDbn: z.boolean().default(false),
     strict: z.boolean().default(false),
     minConfidence: z.number().min(0).max(1).default(0.65),
@@ -124,6 +124,7 @@ export interface Job {
   error?: string;
   config: Config;
   attempts: number;
+  expiresAt?: string;
 }
 export interface Marker {
   beat: number;

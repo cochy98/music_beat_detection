@@ -1,10 +1,31 @@
 # Use with a separate project: docker compose -p beat-studio-dev -f compose.yaml -f compose.dev.yaml up --build -d redis worker
 services:
   redis:
+    networks:
+      default: {ipv4_address: 10.203.90.5}
     ports:
       - "127.0.0.1:${DEV_REDIS_PORT:-6388}:6379"
   worker:
+    networks:
+      default: {ipv4_address: 10.203.90.6}
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     volumes:
       - ./.local-data:/data
       - ./.local-data/models:/models
+
+  web:
+    networks:
+      default: {ipv4_address: 10.203.90.3}
+  api:
+    networks:
+      default: {ipv4_address: 10.203.90.4}
+    environment:
+      TRUSTED_PROXIES: 10.203.90.3
+  cleanup:
+    networks:
+      default: {ipv4_address: 10.203.90.7}
+    volumes: [./.local-data:/data]
+networks:
+  default:
+    ipam:
+      config: !override [{subnet: 10.203.90.0/24}]

@@ -9,47 +9,53 @@ import {
   type Preview,
   type Report,
 } from "../../shared/config";
-import { get, upload } from "./api";
+import { get, upload, ensureSession, ApiError } from "./api";
 import Timeline from "./Timeline";
+import { loadActiveJob, rememberActiveJob, forgetActiveJob } from "./activeJob";
 
-type SavedJob = Pick<Job, "id" | "filename" | "createdAt">;
-const loadHistory = (): SavedJob[] => {
-  try {
-    return JSON.parse(localStorage.getItem("beat-history") ?? "[]")
-      .filter((j: SavedJob) => /^[0-9a-f-]{36}$/.test(j.id))
-      .slice(0, 12);
-  } catch {
-    return [];
-  }
-};
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [config, setConfig] = useState<Config>({ ...defaults });
   const [job, setJob] = useState<Job | null>(null);
   const [report, setReport] = useState<Report | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null);
-  const [history, setHistory] = useState<SavedJob[]>(loadHistory);
-  const [activeId, setActiveId] = useState(() => loadHistory()[0]?.id ?? "");
+  const [activeId, setActiveId] = useState(loadActiveJob);
+  const [sessionReady, setSessionReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [uploadPercent, setUploadPercent] = useState(0);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [connected, setConnected] = useState(true);
   const [dragging, setDragging] = useState(false);
-  const [limit, setLimit] = useState(200 * 1024 * 1024);
+  const [limit, setLimit] = useState(50 * 1024 * 1024);
+  const [checkpoints, setCheckpoints] = useState<Config["checkpoint"][]>(["small0"]);
   const [workerOnline, setWorkerOnline] = useState<boolean | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const active =
-    loading || job?.status === "queued" || job?.status === "running";
+    !sessionReady || loading || (Boolean(activeId) && !job && !error) || job?.status === "queued" || job?.status === "running";
   const set = <K extends keyof Config>(key: K, value: Config[K]) =>
     setConfig((c) => ({ ...c, [key]: value }));
 
   useEffect(() => {
-    void get<{ maxUploadBytes: number }>("/api/config")
-      .then((c) => setLimit(c.maxUploadBytes))
+    // Remove the old persistent history; only the active tab's job is recoverable.
+    try { localStorage.removeItem("beat-history"); } catch { /* Storage may be disabled. */ }
+    let mounted = true;
+    void ensureSession().then(async () => {
+      if (!mounted) return;
+      if (!loadActiveJob()) {
+        const running = await get<Job | null>("/api/active-job");
+        if (mounted && running) {
+          rememberActiveJob(running.id);
+          setActiveId(running.id);
+        }
+      }
+      if (mounted) setSessionReady(true);
+    }).catch((e) => { if (mounted) setError(e.message); });
+    void get<{ maxUploadBytes: number; allowedCheckpoints?: Config["checkpoint"][] }>("/api/config")
+      .then((c) => { setLimit(c.maxUploadBytes); setCheckpoints(c.allowedCheckpoints ?? ["small0"]); })
       .catch(() =>
         setError(
-          "API non raggiungibile. Verifica che i servizi siano avviati.",
+          "Servizio temporaneamente non disponibile. Riprova tra poco.",
         ),
       );
     const check = () =>
@@ -58,10 +64,10 @@ export default function App() {
         .catch(() => setWorkerOnline(null));
     check();
     const timer = setInterval(check, 15000);
-    return () => clearInterval(timer);
+    return () => { mounted = false; clearInterval(timer); };
   }, []);
   useEffect(() => {
-    if (!activeId) return;
+    if (!activeId || !sessionReady) return;
     let alive = true,
       source: EventSource | undefined,
       fallback: ReturnType<typeof setInterval> | undefined;
@@ -75,7 +81,9 @@ export default function App() {
     const receive = async (updated: Job) => {
       if (!alive) return;
       setJob(updated);
+      setError("");
       if (updated.status === "failed") {
+        forgetActiveJob(activeId);
         source?.close();
         if (fallback) clearInterval(fallback);
         setError(updated.error ?? "Elaborazione non riuscita.");
@@ -93,6 +101,7 @@ export default function App() {
             setPreview(p);
             setNotice("Analisi completata. I tuoi marker sono pronti.");
             resultLoaded = true;
+            forgetActiveJob(activeId);
             if (fallback) clearInterval(fallback);
           }
         } catch (e) {
@@ -102,12 +111,20 @@ export default function App() {
         }
       }
     };
+    const unavailable = (e: ApiError) => {
+      if (!alive) return;
+      setError(e.message);
+      if ([401, 404, 410].includes(e.status)) {
+        forgetActiveJob(activeId);
+        source?.close();
+        if (fallback) clearInterval(fallback);
+        setActiveId("");
+      }
+    };
     const poll = () =>
       void get<Job>(`/api/jobs/${activeId}`)
         .then(receive)
-        .catch((e) => {
-          if (alive) setError(e.message);
-        });
+        .catch(unavailable);
     // Polling also retries result loading and keeps the UI usable if SSE is interrupted.
     fallback = setInterval(poll, 5000);
     void get<Job>(`/api/jobs/${activeId}`)
@@ -125,15 +142,13 @@ export default function App() {
           if (alive) setConnected(false);
         };
       })
-      .catch((e) => {
-        if (alive) setError(e.message);
-      });
+      .catch(unavailable);
     return () => {
       alive = false;
       source?.close();
       if (fallback) clearInterval(fallback);
     };
-  }, [activeId]);
+  }, [activeId, sessionReady]);
   useEffect(() => {
     document.title =
       job?.status === "running"
@@ -176,24 +191,20 @@ export default function App() {
     setError("");
     try {
       const created = await upload(file, parsed.data, setUploadPercent);
-      const recent = [
-        {
-          id: created.id,
-          filename: created.filename,
-          createdAt: created.createdAt,
-        },
-        ...history,
-      ].slice(0, 12);
-      setHistory(recent);
-      try {
-        localStorage.setItem("beat-history", JSON.stringify(recent));
-      } catch {
-        /* Storage can be disabled; the current job remains usable. */
-      }
+      rememberActiveJob(created.id);
       setActiveId(created.id);
       setJob(created);
     } catch (e) {
       setError((e as Error).message);
+      // Recover an accepted upload whose HTTP acknowledgement was lost.
+      try {
+        const running = await get<Job | null>("/api/active-job");
+        if (running) {
+          rememberActiveJob(running.id);
+          setActiveId(running.id);
+          setJob(running);
+        }
+      } catch { /* Keep the original error if the service is unreachable. */ }
     } finally {
       setLoading(false);
     }
@@ -404,8 +415,8 @@ export default function App() {
                 </div>
                 {config.backend !== "madmom" && (
                   <>
-                    <label className="field">
-                      Checkpoint
+                    {checkpoints.length > 1 && <label className="field">
+                      Modello
                       <select
                         value={config.checkpoint}
                         onChange={(e) =>
@@ -415,10 +426,9 @@ export default function App() {
                           )
                         }
                       >
-                        <option value="final0">final0</option>
-                        <option value="small0">small0 · più leggero</option>
+                        {checkpoints.map((checkpoint) => <option key={checkpoint} value={checkpoint}>{checkpoint === "small0" ? "small0 · più leggero" : "final0"}</option>)}
                       </select>
-                    </label>
+                    </label>}
                     {checkbox("beatThisDbn", "Decoder DBN per Beat This!")}
                   </>
                 )}
@@ -529,29 +539,6 @@ export default function App() {
               ))}
             </div>
           </div>
-          {history.length > 0 && (
-            <div className="history-row">
-              <span>SESSIONI RECENTI</span>
-              <select
-                aria-label="Sessioni recenti"
-                disabled={loading}
-                value={activeId}
-                onChange={(e) => setActiveId(e.target.value)}
-              >
-                {history.map((h) => (
-                  <option key={h.id} value={h.id}>
-                    {h.filename} ·{" "}
-                    {new Date(h.createdAt).toLocaleString("it-IT", {
-                      month: "short",
-                      day: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
           {error && (
             <div role="alert" className="error-banner">
               <span>!</span>
@@ -563,8 +550,8 @@ export default function App() {
           )}
           {workerOnline === false && (
             <p className="warning-note">
-              Il worker non è connesso. I nuovi job rimarranno in coda fino al
-              suo avvio.
+              Il servizio di analisi non è disponibile. Le nuove analisi
+              rimarranno in coda finché torna disponibile.
             </p>
           )}
           {loading && (
@@ -594,8 +581,8 @@ export default function App() {
                   : "Riconnessione alle notifiche; aggiornamento periodico attivo."}
               </p>
               <small>
-                Le fasi indicano l’avanzamento, non il tempo rimanente. Il primo
-                uso di Beat This! scarica il modello.
+                Le fasi indicano l’avanzamento, non il tempo rimanente. Puoi
+                ricaricare la pagina: ritroverai l’analisi in corso.
               </small>
             </div>
           )}
@@ -613,6 +600,10 @@ export default function App() {
                   ↓ Scarica tutto <span>ZIP</span>
                 </a>
               </div>
+              <p className="warning-note">
+                Scarica i risultati prima di ricaricare la pagina.
+                {job.expiresAt && ` I file scadono il ${new Date(job.expiresAt).toLocaleString("it-IT")}.`}
+              </p>
               <div className="stats">
                 <div>
                   <span>MARKER ESPORTATI</span>
