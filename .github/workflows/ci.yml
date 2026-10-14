@@ -11,10 +11,12 @@ on:
       - 'api/**'
       - 'web/**'
       - 'shared/**'
+      - 'redis/**'
       - 'tests/**'
       - 'scripts/**'
       - 'requirements*.txt'
       - 'package*.json'
+      - '.env*.example'
       - 'Dockerfile'
       - '.dockerignore'
       - 'compose*.yaml'
@@ -28,10 +30,12 @@ on:
       - 'api/**'
       - 'web/**'
       - 'shared/**'
+      - 'redis/**'
       - 'tests/**'
       - 'scripts/**'
       - 'requirements*.txt'
       - 'package*.json'
+      - '.env*.example'
       - 'Dockerfile'
       - '.dockerignore'
       - 'compose*.yaml'
@@ -50,34 +54,48 @@ concurrency:
 jobs:
   typescript:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports: [6379:6379]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e --workspace web
       - run: docker compose config --quiet
+      - run: docker compose --env-file .env.production.example -f compose.prod.yaml config --quiet
+      - run: docker compose -f compose.yaml -f compose.dev.yaml config --quiet
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Build worker for Python tests
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile
           target: worker
-          build-args: WITH_BEAT_THIS=1
+          build-args: |
+            WITH_BEAT_THIS=1
+            SECURITY_REFRESH=${{ github.run_id }}
           platforms: linux/amd64
           load: true
           push: false
@@ -86,10 +104,59 @@ jobs:
           cache-to: type=gha,mode=max,scope=worker-tests
       - run: docker run --rm --entrypoint python -v "$PWD/tests:/app/tests:ro" beat-studio-worker-test -m unittest discover -s tests -v
       - run: docker run --rm --entrypoint python beat-studio-worker-test -m unittest worker.test_worker -v
+      - name: Build integration frontend and API
+        run: docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml build api web redis
+      - name: Start isolated integration stack
+        run: docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml up --no-build --wait redis api web cleanup
+      - name: Queue, recovery, ownership and retention integration tests
+        run: python3 scripts/test-web-integration.py
+      - name: Integration logs on failure
+        if: failure()
+        run: docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml logs --tail 100
+      - name: Remove integration stack
+        if: always()
+        run: docker compose -p beat-studio-ci -f compose.yaml -f compose.ci.yaml down -v
+
+  security:
+    name: Security / ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {image: web, dockerfile: web/Dockerfile, target: '', beat_this: '0'}
+          - {image: api, dockerfile: api/Dockerfile, target: '', beat_this: '0'}
+          - {image: worker, dockerfile: Dockerfile, target: worker, beat_this: '1'}
+          - {image: redis, dockerfile: redis/Dockerfile, target: '', beat_this: '0'}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: {persist-credentials: false}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          build-args: |
+            WITH_BEAT_THIS=${{ matrix.beat_this }}
+            SECURITY_REFRESH=${{ github.run_id }}
+          load: true
+          tags: beat-studio-scan:${{ matrix.image }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      - name: Scan OS and language packages before publishing
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: beat-studio-scan:${{ matrix.image }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
 
   images:
     name: Docker / ${{ matrix.image }}
-    needs: [typescript, python]
+    needs: [typescript, python, security]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -111,6 +178,10 @@ jobs:
             dockerfile: Dockerfile
             target: worker
             beat_this: '1'
+          - image: redis
+            dockerfile: redis/Dockerfile
+            target: ''
+            beat_this: '0'
           - image: cli
             dockerfile: Dockerfile
             target: cli
@@ -120,7 +191,7 @@ jobs:
             target: cli
             beat_this: '1'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Set image name
@@ -128,10 +199,11 @@ jobs:
         shell: bash
         env:
           IMAGE_SUFFIX: ${{ matrix.image }}
-        run: printf 'name=ghcr.io/%s-%s\n' "${GITHUB_REPOSITORY,,}" "$IMAGE_SUFFIX" >> "$GITHUB_OUTPUT"
+        run: |
+          printf 'name=ghcr.io/%s-%s\n' "${GITHUB_REPOSITORY,,}" "$IMAGE_SUFFIX" >> "$GITHUB_OUTPUT"
       - name: Image tags and labels
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ steps.image.outputs.name }}
           # Only main updates latest; pushing an older release must not roll it back.
@@ -143,24 +215,27 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
         with:
           platforms: arm64
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build images and publish trusted refs
-        uses: docker/build-push-action@v7
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
-          build-args: WITH_BEAT_THIS=${{ matrix.beat_this }}
+          build-args: |
+            WITH_BEAT_THIS=${{ matrix.beat_this }}
+            SECURITY_REFRESH=${{ github.run_id }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -169,3 +244,22 @@ jobs:
             type=gha,scope=${{ matrix.image }}
             type=gha,scope=worker-tests
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      - name: Scan the exact published digest
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Immutable reference for manual deployment
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf '\nImage for manual deployment: `%s@%s`\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

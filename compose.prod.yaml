@@ -1,0 +1,157 @@
+name: beat-studio
+x-hardening: &hardening
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+services:
+  web:
+    <<: *hardening
+    image: ${WEB_IMAGE:?Set WEB_IMAGE to a GHCR digest or sha tag}
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 100
+    tmpfs: ["/tmp:size=32m,noexec,nosuid,nodev,mode=1777"]
+    networks:
+      backend: {ipv4_address: 10.203.88.3}
+      proxy: {ipv4_address: 10.203.89.3, aliases: [beat-studio-web]}
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+  api:
+    <<: *hardening
+    image: ${API_IMAGE:?Set API_IMAGE to a GHCR digest or sha tag}
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 100
+    tmpfs: ["/tmp:size=32m,noexec,nosuid,nodev,mode=1777"]
+    networks:
+      backend: {ipv4_address: 10.203.88.4}
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      DATA_DIR: /data
+      PUBLIC_ORIGIN: https://battute.duckdns.org
+      COOKIE_SECURE: "true"
+      ALLOW_LARGE_MODEL: ${ALLOW_LARGE_MODEL:-false}
+      TRUSTED_PROXIES: 10.203.88.3
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      MAX_ACTIVE_JOBS: ${MAX_ACTIVE_JOBS:-6}
+      MAX_JOBS_PER_IP: ${MAX_JOBS_PER_IP:-2}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-5120}
+      MAX_DATA_MB: ${MAX_DATA_MB:-5120}
+    volumes: [jobs:/data]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  worker:
+    <<: *hardening
+    image: ${WORKER_IMAGE:?Set WORKER_IMAGE to a GHCR digest or sha tag}
+    mem_limit: 2560m
+    memswap_limit: 2560m
+    cpus: 1.5
+    pids_limit: 150
+    stop_grace_period: 15s
+    tmpfs: ["/tmp:size=256m,nosuid,nodev,mode=1777"]
+    networks:
+      backend: {ipv4_address: 10.203.88.6}
+    environment: &worker-env
+      REDIS_URL: redis://redis:6379
+      DATA_DIR: /data
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-600}
+      MAX_AUDIO_SECONDS: ${MAX_AUDIO_SECONDS:-300}
+      MAX_AUDIO_CHANNELS: ${MAX_AUDIO_CHANNELS:-2}
+      MAX_SAMPLE_RATE: ${MAX_SAMPLE_RATE:-96000}
+      RETENTION_SECONDS: ${RETENTION_SECONDS:-86400}
+      MAX_QUEUE_AGE_SECONDS: ${MAX_QUEUE_AGE_SECONDS:-7200}
+      NUMBA_CPU_NAME: generic
+      NUMBA_CACHE_DIR: /tmp/numba
+      MPLCONFIGDIR: /tmp/matplotlib
+      TORCH_HOME: /models/torch
+      REQUIRE_MODELS: "true"
+      ALLOW_LARGE_MODEL: ${ALLOW_LARGE_MODEL:-false}
+    volumes: [jobs:/data, "checkpoints:/models:ro"]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import os,socket,redis; r=redis.Redis.from_url(os.environ['REDIS_URL']); assert r.exists('beat:worker:alive:'+socket.gethostname())"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+  cleanup:
+    <<: *hardening
+    image: ${WORKER_IMAGE:?Set WORKER_IMAGE}
+    entrypoint: [python, -m, worker.cleanup]
+    mem_limit: 128m
+    cpus: 0.1
+    pids_limit: 30
+    tmpfs: ["/tmp:size=16m,noexec,nosuid,nodev,mode=1777"]
+    networks:
+      backend: {ipv4_address: 10.203.88.7}
+    environment:
+      <<: *worker-env
+      CLEANUP_INTERVAL_SECONDS: "300"
+      ORPHAN_GRACE_SECONDS: "3600"
+    volumes: [jobs:/data]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import os,redis; assert redis.Redis.from_url(os.environ['REDIS_URL']).exists('beat:cleanup:alive')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+  redis:
+    <<: *hardening
+    image: ${REDIS_IMAGE:?Set REDIS_IMAGE to the GHCR redis image}
+    user: redis
+    mem_limit: 256m
+    cpus: 0.2
+    pids_limit: 50
+    networks:
+      backend: {ipv4_address: 10.203.88.5}
+    command: [redis-server, --appendonly, "yes", --appendfsync, everysec, --maxmemory, 128mb, --maxmemory-policy, noeviction, --save, ""]
+    volumes: [queue:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  models:
+    image: ${WORKER_IMAGE:?Set WORKER_IMAGE}
+    profiles: [prepare]
+    entrypoint: [python, -m, worker.warmup]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2048m
+    pids_limit: 100
+    tmpfs: ["/tmp:size=64m,nosuid,nodev,mode=1777"]
+    networks: [downloads]
+    environment: {TORCH_HOME: /models/torch}
+    volumes: [checkpoints:/models]
+networks:
+  backend:
+    internal: true
+    ipam:
+      config: [{subnet: 10.203.88.0/24}]
+  proxy:
+    external: true
+    name: beat-studio-proxy
+  downloads: {}
+volumes:
+  jobs:
+  checkpoints:
+  queue:

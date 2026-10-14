@@ -12,3 +12,6 @@ dist/
 playwright-report/
 test-results/
 *.tsbuildinfo
+
+.env.production
+.env.production.previous

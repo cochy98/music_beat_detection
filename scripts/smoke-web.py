@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+import http.cookiejar
 import uuid
 import zipfile
 
@@ -21,9 +22,12 @@ def main():
     parser.add_argument("--restart-worker", action="store_true", help="Restart this Compose worker during analysis to verify recovery")
     args = parser.parse_args()
     base = args.url.rstrip("/")
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    with opener.open(urllib.request.Request(base + "/api/session", data=b"{}", headers={"X-Beat-Studio": "1", "Content-Type": "application/json"})) as response:
+        assert response.status == 200
 
     def get(path, headers=None):
-        return urllib.request.urlopen(urllib.request.Request(base + path, headers=headers or {}), timeout=30)
+        return opener.open(urllib.request.Request(base + path, headers=headers or {}), timeout=30)
 
     with get("/api/health") as response:
         assert json.load(response)["workerOnline"], "Worker offline"
@@ -32,8 +36,8 @@ def main():
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="config"\r\n\r\n{config}\r\n'
             f'--{boundary}\r\nContent-Disposition: form-data; name="audio"; filename="{args.audio.name}"\r\n'
             'Content-Type: application/octet-stream\r\n\r\n').encode() + args.audio.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-    request = urllib.request.Request(base + "/api/jobs", data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    request = urllib.request.Request(base + "/api/jobs", data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "X-Beat-Studio": "1"})
+    with opener.open(request, timeout=60) as response:
         assert response.status == 202
         job = json.load(response)
     job_id = job["id"]
@@ -42,7 +46,7 @@ def main():
 
     def listen():
         try:
-            with urllib.request.urlopen(base + f"/api/jobs/{job_id}/events", timeout=args.timeout) as response:
+            with opener.open(base + f"/api/jobs/{job_id}/events", timeout=args.timeout) as response:
                 assert response.headers["Content-Type"].startswith("text/event-stream")
                 for line in response:
                     if line.startswith(b"data: "):
